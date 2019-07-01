@@ -15,258 +15,104 @@
 #include <mfmg/cuda/utils.cuh>
 
 #include <deal.II/base/conditional_ostream.h>
+#include <deal.II/lac/read_write_vector.h>
 
 #include <boost/property_tree/info_parser.hpp>
+#include <boost/test/data/monomorphic.hpp>
+#include <boost/test/data/test_case.hpp>
 
 #include <random>
 
 #include "laplace.hpp"
+#include "laplace_matrix_free_device.cuh"
 #include "main.cc"
+#include "test_hierarchy_helpers_device.cuh"
+
+namespace bdata = boost::unit_test::data;
 
 template <int dim>
-class Source : public dealii::Function<dim>
+double test_mf(std::shared_ptr<boost::property_tree::ptree> params)
 {
-public:
-  Source() = default;
+  using DVector =
+      dealii::LinearAlgebra::distributed::Vector<double,
+                                                 dealii::MemorySpace::CUDA>;
+  using value_type = typename DVector::value_type;
+  using MeshEvaluator = mfmg::CudaMatrixFreeMeshEvaluator<dim>;
 
-  virtual ~Source() override = default;
+  mfmg::CudaHandle cuda_handle;
 
-  virtual double value(dealii::Point<dim> const &,
-                       unsigned int const = 0) const override final
+  MPI_Comm comm = MPI_COMM_WORLD;
+
+  dealii::ConditionalOStream pcout(
+      std::cout, dealii::Utilities::MPI::this_mpi_process(comm) == 0);
+
+  auto material_property =
+      MaterialPropertyFactory<dim>::create_material_property(
+          params->get<std::string>("material_property.type"));
+  Source<dim> source;
+
+  auto laplace_ptree = params->get_child("laplace");
+  int constexpr fe_degree = 1;
+  LaplaceMatrixFreeDevice<dim, fe_degree, value_type> mf_laplace(comm);
+  mf_laplace.setup_system(laplace_ptree, *material_property);
+
+  auto const locally_owned_dofs = mf_laplace._locally_owned_dofs;
+  DVector solution(locally_owned_dofs, comm);
+  DVector rhs(mf_laplace._system_rhs);
+
+  dealii::LinearAlgebra::ReadWriteVector<value_type> rw_vector(
+      locally_owned_dofs);
+  std::default_random_engine generator;
+  std::uniform_real_distribution<value_type> distribution(0., 1.);
+  for (auto const index : locally_owned_dofs)
   {
-    return 0.;
-  }
-};
-
-template <int dim>
-class ConstantMaterialProperty : public dealii::Function<dim>
-{
-public:
-  ConstantMaterialProperty() = default;
-
-  virtual ~ConstantMaterialProperty() override = default;
-
-  virtual double value(dealii::Point<dim> const &,
-                       unsigned int const = 0) const override final
-  {
-    return 1.;
-  }
-};
-
-template <int dim>
-class LinearXMaterialProperty : public dealii::Function<dim>
-{
-public:
-  LinearXMaterialProperty() = default;
-
-  virtual ~LinearXMaterialProperty() override = default;
-
-  virtual double value(dealii::Point<dim> const &p,
-                       unsigned int const = 0) const override final
-  {
-    return 1. + p[0];
-  }
-};
-
-template <int dim>
-class LinearMaterialProperty : public dealii::Function<dim>
-{
-public:
-  LinearMaterialProperty() = default;
-
-  virtual ~LinearMaterialProperty() override = default;
-
-  virtual double value(dealii::Point<dim> const &p,
-                       unsigned int const = 0) const override final
-  {
-    double value = 1.;
-    for (unsigned int d = 0; d < dim; ++d)
-      value += (1. + d) * p[d];
-
-    return value;
-  }
-};
-
-template <int dim>
-class DiscontinuousMaterialProperty : public dealii::Function<dim>
-{
-public:
-  DiscontinuousMaterialProperty() = default;
-
-  virtual ~DiscontinuousMaterialProperty() override = default;
-
-  virtual double value(dealii::Point<dim> const &p,
-                       unsigned int const = 0) const override final
-
-  {
-    double value = 10.;
-    for (unsigned int d = 0; d < dim; ++d)
-      if (p[d] > 0.5)
-        value *= value;
-
-    return value;
-  }
-};
-
-template <int dim>
-class MaterialPropertyFactory
-{
-public:
-  static std::shared_ptr<dealii::Function<dim>>
-  create_material_property(std::string const &material_type)
-  {
-    if (material_type == "constant")
-      return std::make_shared<ConstantMaterialProperty<dim>>();
-    else if (material_type == "linear_x")
-      return std::make_shared<LinearXMaterialProperty<dim>>();
-    else if (material_type == "linear")
-      return std::make_shared<LinearMaterialProperty<dim>>();
-    else if (material_type == "discontinuous")
-      return std::make_shared<DiscontinuousMaterialProperty<dim>>();
+    // Make the solution satisfy the Dirichlet conditions because these should
+    // be treated outside the preconditioner
+    if (mf_laplace._constraints.is_constrained(index))
+      rw_vector[index] = 0.;
     else
-    {
-      mfmg::ASSERT_THROW_NOT_IMPLEMENTED();
-
-      return nullptr;
-    }
+      rw_vector[index] = distribution(generator);
   }
-};
+  solution.import(rw_vector, dealii::VectorOperation::insert);
 
-template <int dim>
-class TestMeshEvaluator : public mfmg::CudaMeshEvaluator<dim>
-{
-public:
-  TestMeshEvaluator(MPI_Comm comm, dealii::DoFHandler<dim> &dof_handler,
-                    dealii::AffineConstraints<double> &constraints,
-                    unsigned int fe_degree,
-                    dealii::TrilinosWrappers::SparseMatrix const &matrix,
-                    std::shared_ptr<dealii::Function<dim>> material_property,
-                    mfmg::CudaHandle &cuda_handle)
-      : mfmg::CudaMeshEvaluator<dim>(cuda_handle, dof_handler, constraints),
-        _comm(comm), _fe_degree(fe_degree), _matrix(matrix),
-        _material_property(material_property)
+  auto evaluator =
+      std::make_shared<TestMFMeshEvaluator<dim, fe_degree, value_type>>(
+          comm, mf_laplace._dof_handler, mf_laplace._constraints,
+          *mf_laplace._laplace_operator, material_property, cuda_handle);
+  mfmg::Hierarchy<DVector> hierarchy(comm, evaluator, params);
+
+  auto const &laplace_operator = mf_laplace._laplace_operator;
+
+  // We want to do 20 V-cycle iterations. The rhs of is zero.
+  // Use D(istributed)Vector because deal has its own Vector class
+  DVector residual(rhs);
+  unsigned int const n_cycles = 20;
+  std::vector<double> res(n_cycles + 1);
+
+  laplace_operator->vmult(residual, solution);
+  residual.sadd(-1., 1., rhs);
+  auto const residual0_norm = residual.l2_norm();
+
+  std::cout << std::scientific;
+  pcout << "#0: " << 1.0 << std::endl;
+  res[0] = 1.0;
+  for (unsigned int i = 0; i < n_cycles; ++i)
   {
+    hierarchy.apply(rhs, solution);
+
+    laplace_operator->vmult(residual, solution);
+    residual.sadd(-1., 1., rhs);
+    double rel_residual = residual.l2_norm() / residual0_norm;
+    pcout << "#" << i + 1 << ": " << rel_residual << std::endl;
+    res[i + 1] = rel_residual;
   }
 
-  virtual ~TestMeshEvaluator() override = default;
+  double const conv_rate = res[n_cycles] / res[n_cycles - 1];
+  pcout << "Convergence rate: " << std::fixed << std::setprecision(2)
+        << conv_rate << std::endl;
 
-  virtual dealii::LinearAlgebra::distributed::Vector<double>
-  get_locally_relevant_diag() const override final
-  {
-    dealii::IndexSet locally_owned_dofs =
-        _matrix.locally_owned_domain_indices();
-    dealii::IndexSet locally_relevant_dofs;
-    dealii::DoFTools::extract_locally_relevant_dofs(this->_dof_handler,
-                                                    locally_relevant_dofs);
-    dealii::LinearAlgebra::distributed::Vector<double>
-        locally_owned_global_diag(locally_owned_dofs, _comm);
-    for (auto const val : locally_owned_dofs)
-      locally_owned_global_diag[val] = _matrix.diag_element(val);
-    locally_owned_global_diag.compress(dealii::VectorOperation::insert);
-
-    dealii::LinearAlgebra::distributed::Vector<double>
-        locally_relevant_global_diag(locally_owned_dofs, locally_relevant_dofs,
-                                     _comm);
-    locally_relevant_global_diag = locally_owned_global_diag;
-
-    return locally_relevant_global_diag;
-  }
-
-  void evaluate_global(
-      dealii::DoFHandler<dim> &, dealii::AffineConstraints<double> &,
-      mfmg::SparseMatrixDevice<double> &system_matrix) const override final
-  {
-    system_matrix = std::move(mfmg::convert_matrix(_matrix));
-    system_matrix.cusparse_handle = this->_cuda_handle.cusparse_handle;
-    cusparseStatus_t cusparse_error_code;
-    cusparse_error_code = cusparseCreateMatDescr(&system_matrix.descr);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-    cusparse_error_code =
-        cusparseSetMatType(system_matrix.descr, CUSPARSE_MATRIX_TYPE_GENERAL);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-    cusparse_error_code =
-        cusparseSetMatIndexBase(system_matrix.descr, CUSPARSE_INDEX_BASE_ZERO);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-  }
-
-  void evaluate_agglomerate(
-      dealii::DoFHandler<dim> &dof_handler,
-      dealii::AffineConstraints<double> &constraints,
-      mfmg::SparseMatrixDevice<double> &system_matrix) const override final
-  {
-    unsigned int const fe_degree = _fe_degree;
-    dealii::FE_Q<dim> fe(fe_degree);
-    dof_handler.distribute_dofs(fe);
-
-    dealii::IndexSet locally_relevant_dofs;
-    dealii::DoFTools::extract_locally_relevant_dofs(dof_handler,
-                                                    locally_relevant_dofs);
-
-    // Compute the constraints
-    constraints.clear();
-    constraints.reinit(locally_relevant_dofs);
-    dealii::DoFTools::make_hanging_node_constraints(dof_handler, constraints);
-    dealii::VectorTools::interpolate_boundary_values(
-        dof_handler, 1, dealii::Functions::ZeroFunction<dim>(), constraints);
-    constraints.close();
-
-    // Build the system sparsity pattern and reinitialize the system sparse
-    // matrix
-    dealii::DynamicSparsityPattern dsp(dof_handler.n_dofs());
-    dealii::DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints);
-    dealii::SparsityPattern agg_system_sparsity_pattern;
-    agg_system_sparsity_pattern.copy_from(dsp);
-    dealii::SparseMatrix<double> agg_system_matrix(agg_system_sparsity_pattern);
-
-    // Fill the system matrix
-    dealii::QGauss<dim> const quadrature(fe_degree + 1);
-    dealii::FEValues<dim> fe_values(
-        fe, quadrature,
-        dealii::update_values | dealii::update_gradients |
-            dealii::update_quadrature_points | dealii::update_JxW_values);
-    unsigned int const dofs_per_cell = fe.dofs_per_cell;
-    unsigned int const n_q_points = quadrature.size();
-    dealii::FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
-    std::vector<dealii::types::global_dof_index> local_dof_indices(
-        dofs_per_cell);
-    for (auto cell :
-         dealii::filter_iterators(dof_handler.active_cell_iterators(),
-                                  dealii::IteratorFilters::LocallyOwnedCell()))
-    {
-      cell_matrix = 0;
-      fe_values.reinit(cell);
-
-      for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          for (unsigned int j = 0; j < dofs_per_cell; ++j)
-            cell_matrix(i, j) += fe_values.shape_grad(i, q_point) *
-                                 fe_values.shape_grad(j, q_point) *
-                                 fe_values.JxW(q_point);
-
-      cell->get_dof_indices(local_dof_indices);
-      constraints.distribute_local_to_global(cell_matrix, local_dof_indices,
-                                             agg_system_matrix);
-    }
-
-    system_matrix = std::move(mfmg::convert_matrix(agg_system_matrix));
-    system_matrix.cusparse_handle = this->_cuda_handle.cusparse_handle;
-    cusparseStatus_t cusparse_error_code;
-    cusparse_error_code = cusparseCreateMatDescr(&system_matrix.descr);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-    cusparse_error_code =
-        cusparseSetMatType(system_matrix.descr, CUSPARSE_MATRIX_TYPE_GENERAL);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-    cusparse_error_code =
-        cusparseSetMatIndexBase(system_matrix.descr, CUSPARSE_INDEX_BASE_ZERO);
-    mfmg::ASSERT_CUSPARSE(cusparse_error_code);
-  }
-
-private:
-  MPI_Comm _comm;
-  unsigned const _fe_degree;
-  dealii::TrilinosWrappers::SparseMatrix const &_matrix;
-  std::shared_ptr<dealii::Function<dim>> _material_property;
-};
+  return conv_rate;
+}
 
 template <int dim>
 double test(std::shared_ptr<boost::property_tree::ptree> params)
@@ -344,16 +190,25 @@ double test(std::shared_ptr<boost::property_tree::ptree> params)
   return conv_rate;
 }
 
-BOOST_AUTO_TEST_CASE(hierarchy_2d)
+BOOST_DATA_TEST_CASE(hierarchy_2d_serial,
+                     bdata::make<std::string>({"matrix_based", "matrix_free"}),
+                     mesh_evaluator_type)
 {
-  unsigned int constexpr dim = 2;
+  if (dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) == 1)
+  {
+    unsigned int constexpr dim = 2;
 
-  auto params = std::make_shared<boost::property_tree::ptree>();
-  boost::property_tree::info_parser::read_info("hierarchy_input.info", *params);
-  // We only supports Jacobi smoother on the device
-  params->put("smoother.type", "Jacobi");
+    auto params = std::make_shared<boost::property_tree::ptree>();
+    boost::property_tree::info_parser::read_info("hierarchy_input.info",
+                                                 *params);
+    // We only supports Jacobi smoother on the device
+    params->put("smoother.type", "Jacobi");
 
-  test<dim>(params);
+    if (mesh_evaluator_type == "matrix_based")
+      test<dim>(params);
+    else
+      test_mf<dim>(params);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(hierarchy_3d)
@@ -420,34 +275,45 @@ BOOST_AUTO_TEST_CASE(hierarchy_3d)
 }
 
 #if MFMG_WITH_AMGX
-BOOST_AUTO_TEST_CASE(amgx)
+BOOST_DATA_TEST_CASE(amgx,
+                     bdata::make<std::string>({"matrix_based", "matrix_free"}),
+                     mesh_evaluator_type)
 {
-  if (dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) == 1)
+  // We do not do as many tests as for the two-grid because AMGx will only
+  // use multiple levels if the problem is large enough.
+  unsigned int constexpr dim = 3;
+  auto params = std::make_shared<boost::property_tree::ptree>();
+  boost::property_tree::info_parser::read_info("hierarchy_input.info", *params);
+  params->put("solver.type", "amgx");
+  params->put("solver.config_file", "amgx_config_fgmres.json");
+
+  params->put("eigensolver.type", "lapack");
+  params->put("agglomeration.nz", 2);
+  params->put("laplace.n_refinements", 5);
+  // We only supports Jacobi smoother on the device
+  params->put("smoother.type", "Jacobi");
+
+  // TODO When using a finely refined mesh and two eigenvectors, AMGx does not
+  // converge. This needs to be invastigated. This can be due to a problem in
+  // AMGx configuration file, a problem when computing the eigenvectors with
+  // Lanczos or another bug.
+  params->put("eigensolver.number of eigenvectors", 1);
+
+  // Relative tolerance in %
+  double const tolerance_percent = 5.;
+  double const ref_solution = 0.24;
+  if (mesh_evaluator_type == "matrix_based")
   {
-    // We do not do as many tests as for the two-grid because AMGx will only
-    // use multiple levels if the problem is large enough.
-    unsigned int constexpr dim = 3;
-    auto params = std::make_shared<boost::property_tree::ptree>();
-    boost::property_tree::info_parser::read_info("hierarchy_input.info",
-                                                 *params);
-    params->put("solver.type", "amgx");
-    params->put("solver.config_file", "amgx_config_fgmres.json");
-
-    params->put("eigensolver.type", "lapack");
-    params->put("agglomeration.nz", 2);
-    params->put("laplace.n_refinements", 5);
-    // We only supports Jacobi smoother on the device
-    params->put("smoother.type", "Jacobi");
-
-    // TODO When using a finely refined mesh and two eigenvectors, AMGx does not
-    // converge. This needs to be invastigated. This can be due to a problem in
-    // AMGx configuration file, a problem when computing the eigenvectors with
-    // Lanczos or another bug.
-    params->put("eigensolver.number of eigenvectors", 1);
-
-    // Relative tolerance in %
-    double const tolerance_percent = 5.;
-    double const ref_solution = 0.24;
+    // TODO in parallel the coarse matrix produced is wrong
+    if (dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) == 1)
+    {
+      double const conv_rate = test<dim>(params);
+      BOOST_CHECK_CLOSE(conv_rate, ref_solution, tolerance_percent);
+    }
+  }
+  else
+  {
+    double const conv_rate = test_mf<dim>(params);
     BOOST_CHECK_CLOSE(conv_rate, ref_solution, tolerance_percent);
   }
 }

@@ -20,6 +20,9 @@
 #include <mfmg/dealii/dealii_matrix_free_hierarchy_helpers.hpp>
 #ifdef MFMG_WITH_CUDA
 #include <mfmg/cuda/cuda_hierarchy_helpers.cuh>
+#include <mfmg/cuda/cuda_matrix_free_hierarchy_helpers.cuh>
+#include <mfmg/cuda/cuda_matrix_free_mesh_evaluator.cuh>
+#include <mfmg/cuda/cuda_matrix_free_operator.cuh>
 #include <mfmg/cuda/cuda_matrix_operator.cuh>
 #include <mfmg/cuda/cuda_mesh_evaluator.cuh>
 #endif
@@ -45,6 +48,37 @@ void timer_leave_subsection(std::shared_ptr<dealii::TimerOutput> const &timer)
   if (timer)
     timer->leave_subsection();
 }
+
+template <int dim, typename VectorType>
+struct MatrixFreeHierachyHelpersDevice
+{
+  static create(
+      std::unique_ptr<HierarchyHelpers<VectorType>> &hierarchy_helpers,
+      std::shared_ptr<MeshEvaluator const> &evaluator)
+  {
+    ASSERT_THROW_NOT_IMPLEMENTED();
+  }
+};
+
+template <int dim>
+struct MatrixFreeHierachyHelpersDevice<
+    dim, dealii::LinearAlgebra::distributed::Vector<double,
+                                                    dealii::MemorySpace::CUDA>>
+{
+  static create(std::unique_ptr<
+                    HierarchyHelpers<dealii::LinearAlgebra::distributed::Vector<
+                        double, dealii::MemorySpace::CUDA>>> &hierarchy_helpers,
+                std::shared_ptr<MeshEvaluator const> &evaluator)
+  {
+    auto const cuda_evaluator =
+        std::dynamic_pointer_cast<CudaMatrixFreeMeshEvaluator<2> const>(
+            evaluator);
+    hierarchy_helpers.reset(new CudaMatrixFreeHierarchyHelpers<
+                            dim, dealii::LinearAlgebra::distributed::Vector<
+                                     double, dealii::MemorySpace::CUDA>>(
+        cuda_evaluator->get_cuda_handle()));
+  }
+};
 
 template <typename VectorType>
 std::unique_ptr<HierarchyHelpers<VectorType>>
@@ -98,6 +132,23 @@ create_hierarchy_helpers(std::shared_ptr<MeshEvaluator const> evaluator)
     else
       ASSERT_THROW_NOT_IMPLEMENTED();
   }
+  else if (evaluator_type == "CudaMatrixFreeMeshEvaluator")
+  {
+    int const dim = evaluator->get_dim();
+
+    if (dim == 2)
+    {
+      MatrixFreeHierachyHelpersDevice<2, VectorType>::create(hierarchy_helpers,
+                                                             evaluator);
+    }
+    else if (dim == 3)
+    {
+      MatrixFreeHierachyHelpersDevice<3, VectorType>::create(hierarchy_helpers,
+                                                             evaluator);
+    }
+    else
+      ASSERT_THROW_NOT_IMPLEMENTED();
+  }
 #endif
   else
   {
@@ -141,6 +192,35 @@ create_hierarchy_helpers(std::shared_ptr<MeshEvaluator const> evaluator)
                                    dealii::LinearAlgebra::distributed::Vector<
                                        double, dealii::MemorySpace::CUDA>>(
               cuda_evaluator->get_cuda_handle()));
+    }
+    else
+      ASSERT_THROW_NOT_IMPLEMENTED();
+  }
+  if (evaluator_type == "CudaMatrixFreeMeshEvaluator")
+  {
+    int const dim = evaluator->get_dim();
+
+    if (dim == 2)
+    {
+      // Downcast evaluator
+      auto const cuda_evaluator =
+          std::dynamic_pointer_cast<CudaMatrixFreeMeshEvaluator<2> const>(
+              evaluator);
+      hierarchy_helpers.reset(new CudaMatrixFreeHierarchyHelpers<
+                              2, dealii::LinearAlgebra::distributed::Vector<
+                                     double, dealii::MemorySpace::CUDA>>(
+          cuda_evaluator->get_cuda_handle()));
+    }
+    else if (dim == 3)
+    {
+      // Downcast evaluator
+      auto const cuda_evaluator =
+          std::dynamic_pointer_cast<CudaMatrixFreeMeshEvaluator<3> const>(
+              evaluator);
+      hierarchy_helpers.reset(new CudaMatrixFreeHierarchyHelpers<
+                              3, dealii::LinearAlgebra::distributed::Vector<
+                                     double, dealii::MemorySpace::CUDA>>(
+          cuda_evaluator->get_cuda_handle()));
     }
     else
       ASSERT_THROW_NOT_IMPLEMENTED();
